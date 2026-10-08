@@ -74,4 +74,3 @@ def create_grad_scaler(
     if not policy.uses_grad_scaler:
         return None
     return torch.amp.GradScaler(device.type, enabled=True)
-

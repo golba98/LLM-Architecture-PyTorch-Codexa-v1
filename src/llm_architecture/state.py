@@ -23,4 +23,3 @@ class TrainingState:
             name: _json_value(value, name)
             for name, value in asdict(self).items()
         }
-
