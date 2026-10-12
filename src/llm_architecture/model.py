@@ -214,10 +214,6 @@ class CausalSelfAttention(nn.Module):
                 is_causal=True,
             )
         else:
-            if attention_mask is not None and attention_mask.shape != (batch_size, sequence_length):
-                raise ValueError(
-                    "attention_mask must match [batch, sequence]."
-                )
             causal = torch.ones(
                 (sequence_length, past_length + sequence_length),
                 dtype=torch.bool,
@@ -226,7 +222,11 @@ class CausalSelfAttention(nn.Module):
             causal = torch.tril(causal, diagonal=past_length)
             allowed = causal[None, None, :, :]
             if attention_mask is not None:
-                if past_length:
+                # Key mask over cached plus current tokens; a current-token
+                # mask treats the cached prefix as fully valid.
+                if attention_mask.shape == (batch_size, past_length + sequence_length):
+                    key_mask = attention_mask
+                elif attention_mask.shape == (batch_size, sequence_length):
                     past_mask = torch.ones(
                         (batch_size, past_length),
                         dtype=torch.bool,
@@ -234,7 +234,10 @@ class CausalSelfAttention(nn.Module):
                     )
                     key_mask = torch.cat((past_mask, attention_mask), dim=1)
                 else:
-                    key_mask = attention_mask
+                    raise ValueError(
+                        "attention_mask must match [batch, past_length + sequence] "
+                        "or [batch, sequence]."
+                    )
                 allowed = allowed & key_mask[:, None, None, :]
             attention_output = F.scaled_dot_product_attention(
                 query,
@@ -429,6 +432,20 @@ class LanguageModel(nn.Module):
         tuple[torch.Tensor, torch.Tensor | None]
         | tuple[torch.Tensor, torch.Tensor | None, KeyValueCache]
     ):
+        """Run the decoder, optionally continuing from cached keys and values.
+
+        ``attention_mask`` marks real (True) and padding (False) tokens. Its shape
+        is either ``[batch, past_length + sequence]``, covering cached and current
+        tokens, or ``[batch, sequence]``, covering current tokens only, in which
+        case the cached prefix is treated as fully valid. Padding inside a cache
+        is honored only through the full form, which the caller keeps across
+        steps; the cache itself stores no mask.
+
+        Without ``position_ids``, positions count real tokens across the cached
+        and current tokens (``cumsum(mask) - 1``), or are
+        ``past_length .. past_length + sequence - 1`` when no mask is given.
+        """
+
         if input_ids.ndim != 2:
             raise ValueError(
                 "input_ids must have shape [batch, sequence]; "
@@ -471,10 +488,29 @@ class LanguageModel(nn.Module):
                 )
 
         if attention_mask is not None:
-            if attention_mask.shape != input_ids.shape:
-                raise ValueError("attention_mask must match input_ids shape.")
             if attention_mask.dtype != torch.bool:
                 attention_mask = attention_mask.to(dtype=torch.bool)
+            if attention_mask.shape == (batch_size, past_length + sequence_length):
+                pass
+            elif attention_mask.shape == input_ids.shape:
+                attention_mask = torch.cat(
+                    (
+                        torch.ones(
+                            (batch_size, past_length),
+                            dtype=torch.bool,
+                            device=attention_mask.device,
+                        ),
+                        attention_mask,
+                    ),
+                    dim=1,
+                )
+            else:
+                raise ValueError(
+                    "attention_mask must have shape [batch, past_length + sequence] "
+                    "or [batch, sequence]; got "
+                    f"{tuple(attention_mask.shape)} for input_ids "
+                    f"{tuple(input_ids.shape)} and past_length {past_length}."
+                )
         if position_ids is None:
             if attention_mask is None:
                 positions = torch.arange(
@@ -487,11 +523,13 @@ class LanguageModel(nn.Module):
                     positions = positions.unsqueeze(0).expand(batch_size, -1)
             else:
                 positions = attention_mask.long().cumsum(dim=-1) - 1
-                positions.clamp_(min=0)
+                positions = positions[:, past_length:].clamp_(min=0)
         else:
             if position_ids.shape != input_ids.shape:
                 raise ValueError("position_ids must match input_ids shape.")
             positions = position_ids.to(device=input_ids.device, dtype=torch.long)
+            if int(positions.min().item()) < 0:
+                raise ValueError("position_ids must be non-negative.")
         if int(positions.max().item()) >= self.config.context_length:
             raise ValueError("position_ids exceed context_length.")
         hidden_states = self.token_embeddings(input_ids.to(dtype=torch.long))
