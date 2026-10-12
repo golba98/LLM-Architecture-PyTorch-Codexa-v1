@@ -33,6 +33,10 @@ def verify_checkpoint_checksum(path: str | Path) -> str:
     """Validate a checkpoint against its required SHA-256 sidecar."""
 
     checkpoint_path = Path(path)
+    if checkpoint_path.name.endswith('.ckpt.json'):
+        from .component_checkpoint import manifest_document
+        manifest_document(checkpoint_path)
+        return file_sha256(checkpoint_path)
     checksum_path = checkpoint_path.with_suffix(
         checkpoint_path.suffix + ".sha256"
     )
@@ -89,13 +93,14 @@ def load_model_checkpoint(
     """Load only model weights and inference metadata from a trusted checkpoint."""
 
     checkpoint_path = Path(path)
-    verify_checkpoint_checksum(checkpoint_path)
+    if not checkpoint_path.name.endswith('.ckpt.json'):
+        verify_checkpoint_checksum(checkpoint_path)
     try:
-        payload = torch.load(
-            checkpoint_path,
-            map_location=map_location,
-            weights_only=False,
-        )
+        if checkpoint_path.name.endswith('.ckpt.json'):
+            from .component_checkpoint import read_components
+            payload = read_components(checkpoint_path, model_only=True, map_location=map_location)
+        else:
+            payload = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
     except Exception as error:
         raise ValueError(
             f"Failed to deserialize checkpoint {checkpoint_path}: {error}"
@@ -138,10 +143,19 @@ def load_model_checkpoint(
     )
 
 
-def read_native_checkpoint(path: str | Path) -> dict:
+def read_native_checkpoint(path: str | Path, *, model_only: bool = False, map_location="cpu",
+                           expected_sha256: str | None = None) -> dict:
     """Verify and map a trusted full, legacy SFT, or native export checkpoint."""
-    verify_checkpoint_checksum(path)
-    payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    if Path(path).name.endswith('.ckpt.json'):
+        if expected_sha256 is not None and not hmac.compare_digest(file_sha256(path), expected_sha256):
+            raise ValueError("Checkpoint identity does not match the selected model.")
+        from .component_checkpoint import read_components
+        payload = read_components(Path(path), model_only=model_only, map_location=map_location)
+    else:
+        actual = verify_checkpoint_checksum(path)
+        if expected_sha256 is not None and not hmac.compare_digest(actual, expected_sha256):
+            raise ValueError("Checkpoint identity does not match the selected model.")
+        payload = torch.load(path, map_location=map_location, weights_only=False, mmap=True)
     if not isinstance(payload, dict):
         raise ValueError("Checkpoint payload must be an object.")
     if payload.get("format_version") not in (None, CHECKPOINT_FORMAT_VERSION):
