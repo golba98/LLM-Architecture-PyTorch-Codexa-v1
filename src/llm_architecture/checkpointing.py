@@ -1,14 +1,19 @@
 """Checksummed native model loading, independent of optimizers and trainers."""
+
 from dataclasses import dataclass
 import hashlib
 import hmac
 import math
 from pathlib import Path
+
 import torch
 from torch import nn
+
 from .state import TrainingState
 from .model import ModelConfig
+
 CHECKPOINT_FORMAT_VERSION = 1
+
 
 @dataclass(frozen=True)
 class InferenceCheckpoint:
@@ -22,6 +27,7 @@ class InferenceCheckpoint:
     tokenizer_reference: str | None
     tokenizer_sha256: str | None
 
+
 def file_sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as input_file:
@@ -29,12 +35,14 @@ def file_sha256(path: str | Path) -> str:
             digest.update(chunk)
     return digest.hexdigest()
 
+
 def verify_checkpoint_checksum(path: str | Path) -> str:
     """Validate a checkpoint against its required SHA-256 sidecar."""
 
     checkpoint_path = Path(path)
     if checkpoint_path.name.endswith('.ckpt.json'):
         from .component_checkpoint import manifest_document
+
         manifest_document(checkpoint_path)
         return file_sha256(checkpoint_path)
     checksum_path = checkpoint_path.with_suffix(
@@ -57,6 +65,7 @@ def verify_checkpoint_checksum(path: str | Path) -> str:
             f"expected {expected}, got {actual}."
         )
     return actual
+
 
 def _validate_training_state(value: object) -> TrainingState:
     if not isinstance(value, dict):
@@ -84,6 +93,7 @@ def _validate_training_state(value: object) -> TrainingState:
         raise ValueError("Checkpoint best validation loss is invalid.")
     return state
 
+
 def load_model_checkpoint(
     path: str | Path,
     *,
@@ -98,6 +108,7 @@ def load_model_checkpoint(
     try:
         if checkpoint_path.name.endswith('.ckpt.json'):
             from .component_checkpoint import read_components
+
             payload = read_components(checkpoint_path, model_only=True, map_location=map_location)
         else:
             payload = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
@@ -143,17 +154,27 @@ def load_model_checkpoint(
     )
 
 
-def read_native_checkpoint(path: str | Path, *, model_only: bool = False, map_location="cpu",
-                           expected_sha256: str | None = None) -> dict:
+def read_native_checkpoint(
+    path: str | Path,
+    *,
+    model_only: bool = False,
+    map_location="cpu",
+    expected_sha256: str | None = None,
+) -> dict:
     """Verify and map a trusted full, legacy SFT, or native export checkpoint."""
     if Path(path).name.endswith('.ckpt.json'):
-        if expected_sha256 is not None and not hmac.compare_digest(file_sha256(path), expected_sha256):
+        if expected_sha256 is not None and not hmac.compare_digest(
+            file_sha256(path), expected_sha256
+        ):
             raise ValueError("Checkpoint identity does not match the selected model.")
         from .component_checkpoint import read_components
+
         payload = read_components(Path(path), model_only=model_only, map_location=map_location)
     else:
         actual = verify_checkpoint_checksum(path)
-        if expected_sha256 is not None and not hmac.compare_digest(actual, expected_sha256):
+        if expected_sha256 is not None and not hmac.compare_digest(
+            actual, expected_sha256
+        ):
             raise ValueError("Checkpoint identity does not match the selected model.")
         payload = torch.load(path, map_location=map_location, weights_only=False, mmap=True)
     if not isinstance(payload, dict):

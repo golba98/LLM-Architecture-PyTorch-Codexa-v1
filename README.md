@@ -14,6 +14,29 @@ For a separately installed checkout, run `python -m pytest` after provisioning t
 
 Import the package modules directly.
 
+## Package map
+
+| Module | Responsibility |
+| --- | --- |
+| `model.py` | Public configuration, layers, language model and parameter count. The two `forward` methods show execution order. |
+| `_model_inputs.py`, `_attention_ops.py` | Input, mask and position validation; rotary attention, KV-cache extension and causal SDPA. |
+| `checkpointing.py`, `checkpoint_inspection.py` | Native checkpoint loading and read-only storage inspection. |
+| `component_checkpoint.py` | Public component-checkpoint imports and the single-writer `ComponentStore`. |
+| `_component_files.py`, `_component_reader.py` | Durable file operations and quota accounting; manifest verification, reader admission and mapped-storage leases. |
+| `runtime.py`, `state.py` | Device and precision policy; serializable training counters. |
+
+Keep new implementation details in the owning module and preserve the existing
+public import paths. Model classes stay in `model.py` so their Python identities
+and state-dictionary layout remain stable. The cache stores keys and values, not
+padding masks: callers must retain a full mask when cached padding matters.
+Labels are shifted by Data/SFT before this package receives them.
+
+Component manifests and objects are immutable. A format or model-equation change
+requires an explicit compatibility decision and focused regression coverage;
+ordinary cleanup must retain existing checkpoint bytes, lock order and strict
+state-dictionary loading. Run bounded, source-first tests through the workspace
+runner shown above.
+
 ## Integration and assets
 
 `../LLM-From-Scratch/compatibility.json` records the complete tested version set.

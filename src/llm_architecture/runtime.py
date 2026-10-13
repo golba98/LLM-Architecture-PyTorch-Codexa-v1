@@ -1,8 +1,11 @@
 """Device and arithmetic policies usable without importing the trainer."""
+
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
+
 import torch
+
 
 @dataclass(frozen=True)
 class PrecisionPolicy:
@@ -11,6 +14,7 @@ class PrecisionPolicy:
     name: str
     autocast_dtype: torch.dtype | None
     uses_grad_scaler: bool
+
 
 def resolve_device(requested: str) -> torch.device:
     """Resolve auto, CPU, or CUDA without an implicit CUDA fallback."""
@@ -25,6 +29,7 @@ def resolve_device(requested: str) -> torch.device:
     if requested == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was explicitly requested but is unavailable.")
     return torch.device(requested)
+
 
 def resolve_precision(requested: str, device: torch.device) -> PrecisionPolicy:
     """Validate and resolve the requested arithmetic precision."""
@@ -50,11 +55,14 @@ def resolve_precision(requested: str, device: torch.device) -> PrecisionPolicy:
         return PrecisionPolicy("bf16", torch.bfloat16, False)
     return PrecisionPolicy("fp16", torch.float16, True)
 
+
 def autocast_dtype(policy: PrecisionPolicy) -> torch.dtype | None:
     return policy.autocast_dtype
 
+
 def requires_grad_scaler(policy: PrecisionPolicy) -> bool:
     return policy.uses_grad_scaler
+
 
 def autocast_context(
     device: torch.device,
@@ -66,6 +74,7 @@ def autocast_context(
         device_type=device.type,
         dtype=policy.autocast_dtype,
     )
+
 
 def create_grad_scaler(
     device: torch.device,
