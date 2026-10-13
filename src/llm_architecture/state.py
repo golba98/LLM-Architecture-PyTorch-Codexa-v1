@@ -1,11 +1,14 @@
 """Serializable training counters shared by checkpoint readers and writers."""
+
 from dataclasses import asdict, dataclass
 import math
+
 
 def _json_value(value: object, field_name: str) -> object:
     if isinstance(value, float) and not math.isfinite(value):
         raise ValueError(f"{field_name} must be finite; got {value!r}.")
     return value
+
 
 @dataclass
 class TrainingState:

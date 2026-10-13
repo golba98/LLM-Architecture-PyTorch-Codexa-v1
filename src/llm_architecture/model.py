@@ -7,14 +7,8 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-
-_INTEGER_DTYPES = {
-    torch.uint8,
-    torch.int8,
-    torch.int16,
-    torch.int32,
-    torch.int64,
-}
+from ._attention_ops import append_cache, apply_rotary, causal_attention, split_heads
+from ._model_inputs import prepare_model_inputs
 
 LayerKeyValue = tuple[torch.Tensor, torch.Tensor]
 KeyValueCache = tuple[LayerKeyValue, ...]
@@ -145,108 +139,24 @@ class CausalSelfAttention(nn.Module):
 
         batch_size, sequence_length, _ = inputs.shape
         query, key, value = self.qkv_projection(inputs).chunk(3, dim=-1)
-
-        def split_heads(tensor: torch.Tensor) -> torch.Tensor:
-            return tensor.reshape(
-                batch_size,
-                sequence_length,
-                self.num_heads,
-                self.head_dimension,
-            ).transpose(1, 2)
-
-        query = split_heads(query)
-        key = split_heads(key)
-        value = split_heads(value)
+        query = split_heads(query, self.num_heads)
+        key = split_heads(key, self.num_heads)
+        value = split_heads(value, self.num_heads)
 
         if self.position_embedding_type == "rotary":
             if position_ids is None or position_ids.shape != (batch_size, sequence_length):
                 raise ValueError("Rotary attention requires position_ids matching inputs.")
-            half = self.head_dimension // 2
-            frequencies = torch.arange(
-                0, half, device=inputs.device, dtype=torch.float32
-            )
-            frequencies = self.rope_theta ** (-frequencies / half)
-            angles = position_ids.to(dtype=torch.float32)[..., None] * frequencies
-            cosines = angles.cos()[:, None, :, :].to(dtype=query.dtype)
-            sines = angles.sin()[:, None, :, :].to(dtype=query.dtype)
+            query, key = apply_rotary(query, key, position_ids, self.rope_theta)
 
-            def rotate(tensor: torch.Tensor) -> torch.Tensor:
-                first, second = tensor[..., :half], tensor[..., half : 2 * half]
-                rotated = torch.cat(
-                    (first * cosines - second * sines, first * sines + second * cosines),
-                    dim=-1,
-                )
-                if tensor.shape[-1] > 2 * half:
-                    rotated = torch.cat((rotated, tensor[..., 2 * half :]), dim=-1)
-                return rotated
-
-            query = rotate(query)
-            key = rotate(key)
-
-        past_length = 0
-        if past_key_value is not None:
-            past_key, past_value = past_key_value
-            expected_shape = (
-                batch_size,
-                self.num_heads,
-                self.head_dimension,
-            )
-            if past_key.ndim != 4 or past_value.ndim != 4:
-                raise ValueError("Cached keys and values must be four-dimensional.")
-            if past_key.shape[:2] != expected_shape[:2] or past_value.shape[:2] != expected_shape[:2]:
-                raise ValueError("Cached keys and values have incompatible batch or head dimensions.")
-            if past_key.shape[-1] != self.head_dimension or past_value.shape[-1] != self.head_dimension:
-                raise ValueError("Cached keys and values have an incompatible head dimension.")
-            if past_key.shape[2] != past_value.shape[2]:
-                raise ValueError("Cached keys and values must have the same sequence length.")
-            past_length = past_key.shape[2]
-            key = torch.cat((past_key.to(dtype=key.dtype), key), dim=2)
-            value = torch.cat((past_value.to(dtype=value.dtype), value), dim=2)
-
-        present_key_value = (key, value)
-
-        if attention_mask is None and past_length == 0:
-            attention_output = F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=True,
-            )
-        else:
-            causal = torch.ones(
-                (sequence_length, past_length + sequence_length),
-                dtype=torch.bool,
-                device=inputs.device,
-            )
-            causal = torch.tril(causal, diagonal=past_length)
-            allowed = causal[None, None, :, :]
-            if attention_mask is not None:
-                # Key mask over cached plus current tokens; a current-token
-                # mask treats the cached prefix as fully valid.
-                if attention_mask.shape == (batch_size, past_length + sequence_length):
-                    key_mask = attention_mask
-                elif attention_mask.shape == (batch_size, sequence_length):
-                    past_mask = torch.ones(
-                        (batch_size, past_length),
-                        dtype=torch.bool,
-                        device=inputs.device,
-                    )
-                    key_mask = torch.cat((past_mask, attention_mask), dim=1)
-                else:
-                    raise ValueError(
-                        "attention_mask must match [batch, past_length + sequence] "
-                        "or [batch, sequence]."
-                    )
-                allowed = allowed & key_mask[:, None, None, :]
-            attention_output = F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=allowed,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=False,
-            )
+        key, value, past_length = append_cache(key, value, past_key_value)
+        attention_output = causal_attention(
+            query,
+            key,
+            value,
+            attention_mask,
+            past_length,
+            self.dropout if self.training else 0.0,
+        )
         attention_output = attention_output.transpose(1, 2).contiguous().reshape(
             batch_size,
             sequence_length,
@@ -254,7 +164,7 @@ class CausalSelfAttention(nn.Module):
         )
         output = self.output_projection(attention_output)
         if use_cache:
-            return output, present_key_value
+            return output, (key, value)
         return output
 
 
@@ -446,92 +356,15 @@ class LanguageModel(nn.Module):
         ``past_length .. past_length + sequence - 1`` when no mask is given.
         """
 
-        if input_ids.ndim != 2:
-            raise ValueError(
-                "input_ids must have shape [batch, sequence]; "
-                f"got shape {tuple(input_ids.shape)}."
-            )
-        if input_ids.dtype not in _INTEGER_DTYPES:
-            raise TypeError(
-                "input_ids must use an integer dtype; "
-                f"got {input_ids.dtype}."
-            )
-
-        batch_size, sequence_length = input_ids.shape
-        past_length = 0
-        if past_key_values is not None:
-            if len(past_key_values) != self.config.num_layers:
-                raise ValueError("past_key_values must contain one entry per layer.")
-            if past_key_values:
-                past_length = past_key_values[0][0].shape[2]
-            if any(cache[0].shape[2] != past_length for cache in past_key_values):
-                raise ValueError("All cached layers must have the same sequence length.")
-        if past_length + sequence_length > self.config.context_length:
-            raise ValueError(
-                "input sequence length exceeds context_length; "
-                f"got {past_length + sequence_length} and maximum "
-                f"{self.config.context_length}."
-            )
-        if past_key_values is not None and not use_cache:
-            raise ValueError("past_key_values requires use_cache=True.")
-
-        if labels is not None:
-            if labels.shape != input_ids.shape:
-                raise ValueError(
-                    "labels must have the same shape as input_ids; "
-                    f"got labels {tuple(labels.shape)} and "
-                    f"input_ids {tuple(input_ids.shape)}."
-                )
-            if labels.dtype not in _INTEGER_DTYPES:
-                raise TypeError(
-                    f"labels must use an integer dtype; got {labels.dtype}."
-                )
-
-        if attention_mask is not None:
-            if attention_mask.dtype != torch.bool:
-                attention_mask = attention_mask.to(dtype=torch.bool)
-            if attention_mask.shape == (batch_size, past_length + sequence_length):
-                pass
-            elif attention_mask.shape == input_ids.shape:
-                attention_mask = torch.cat(
-                    (
-                        torch.ones(
-                            (batch_size, past_length),
-                            dtype=torch.bool,
-                            device=attention_mask.device,
-                        ),
-                        attention_mask,
-                    ),
-                    dim=1,
-                )
-            else:
-                raise ValueError(
-                    "attention_mask must have shape [batch, past_length + sequence] "
-                    "or [batch, sequence]; got "
-                    f"{tuple(attention_mask.shape)} for input_ids "
-                    f"{tuple(input_ids.shape)} and past_length {past_length}."
-                )
-        if position_ids is None:
-            if attention_mask is None:
-                positions = torch.arange(
-                    past_length,
-                    past_length + sequence_length,
-                    device=input_ids.device,
-                    dtype=torch.long,
-                )
-                if self.config.position_embedding_type == "rotary":
-                    positions = positions.unsqueeze(0).expand(batch_size, -1)
-            else:
-                positions = attention_mask.long().cumsum(dim=-1) - 1
-                positions = positions[:, past_length:].clamp_(min=0)
-        else:
-            if position_ids.shape != input_ids.shape:
-                raise ValueError("position_ids must match input_ids shape.")
-            positions = position_ids.to(device=input_ids.device, dtype=torch.long)
-            if int(positions.min().item()) < 0:
-                raise ValueError("position_ids must be non-negative.")
-        if int(positions.max().item()) >= self.config.context_length:
-            raise ValueError("position_ids exceed context_length.")
+        attention_mask, positions = prepare_model_inputs(
+            input_ids,
+            labels,
+            attention_mask,
+            position_ids,
+            past_key_values,
+            use_cache,
+            self.config,
+        )
         hidden_states = self.token_embeddings(input_ids.to(dtype=torch.long))
         if self.position_embeddings is not None:
             hidden_states = hidden_states + self.position_embeddings(positions)
